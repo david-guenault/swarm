@@ -2,6 +2,8 @@ package consul
 
 import (
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"path"
 	"strings"
 	"time"
@@ -27,8 +29,40 @@ func (s *ConsulDiscoveryService) Initialize(uris string, heartbeat int) error {
 	if len(parts) < 2 {
 		return fmt.Errorf("invalid format %q, missing <path>", uris)
 	}
-	addr := parts[0]
+
 	path := parts[1]
+	addr := ""
+
+	listip := strings.Split(parts[0], ",")
+	for idxip := range listip {
+		log.WithField("name", "consul").Debug("Trying ", listip[idxip])
+		resp, errget := http.Get(strings.Join([]string{"http://", listip[idxip]}, ""))
+		if errget != nil {
+			log.WithField("name", "consul").Debug("Get error ", errget)
+			continue
+		}
+		defer resp.Body.Close()
+		body, errbody := ioutil.ReadAll(resp.Body)
+		if errbody != nil {
+			log.WithField("name", "consul").Debug("Read body error ", errbody)
+			continue
+		}
+		if string(body) != "Consul Agent" {
+			log.WithField("name", "consul").Debug("Not a consul agent ")
+			continue
+		} else {
+			addr = listip[idxip]
+			log.WithField("name", "consul").Debug("Found available node ", addr)
+			break
+		}
+	}
+
+	s.heartbeat = time.Duration(heartbeat) * time.Second
+	s.prefix = path + "/"
+
+	if addr == "" {
+		return fmt.Errorf("No available consul nodes at %q", uris)
+	}
 
 	config := consul.DefaultConfig()
 	config.Address = addr
@@ -38,8 +72,7 @@ func (s *ConsulDiscoveryService) Initialize(uris string, heartbeat int) error {
 		return err
 	}
 	s.client = client
-	s.heartbeat = time.Duration(heartbeat) * time.Second
-	s.prefix = path + "/"
+
 	kv := s.client.KV()
 	p := &consul.KVPair{Key: s.prefix, Value: nil}
 	if _, err = kv.Put(p, nil); err != nil {
