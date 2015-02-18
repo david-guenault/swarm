@@ -2,6 +2,7 @@ package consul
 
 import (
 	"fmt"
+	"math/rand"
 	"path"
 	"strings"
 	"time"
@@ -16,6 +17,9 @@ type ConsulDiscoveryService struct {
 	client    *consul.Client
 	prefix    string
 	lastIndex uint64
+	machines  []string
+	machine   string
+	uris      []string
 }
 
 func init() {
@@ -27,35 +31,93 @@ func (s *ConsulDiscoveryService) Initialize(uris string, heartbeat int) error {
 	if len(parts) < 2 {
 		return fmt.Errorf("invalid format %q, missing <path>", uris)
 	}
-	addr := parts[0]
-	path := parts[1]
 
-	config := consul.DefaultConfig()
-	config.Address = addr
+	s.heartbeat = time.Duration(heartbeat) * time.Second
+	s.prefix = parts[1] + "/"
 
-	client, err := consul.NewClient(config)
+	s.uris = strings.Split(parts[0], ",")
+
+	err := s.GetMembers()
 	if err != nil {
 		return err
+	}
+
+	err = s.InitializeClient()
+	return err
+}
+
+func (s *ConsulDiscoveryService) InitializeClient() error {
+	// pick a random node
+	if len(s.machines) < 1 {
+		fmt.Errorf("No consul members found")
+	}
+	s.machine = s.machines[rand.Intn(len(s.machines))]
+
+	// create client
+	config := consul.DefaultConfig()
+	config.Address = s.machine
+	client, errclient := consul.NewClient(config)
+	if errclient != nil {
+		return errclient
 	}
 	s.client = client
-	s.heartbeat = time.Duration(heartbeat) * time.Second
-	s.prefix = path + "/"
+
+	// initialize path
 	kv := s.client.KV()
 	p := &consul.KVPair{Key: s.prefix, Value: nil}
-	if _, err = kv.Put(p, nil); err != nil {
-		return err
+	_, errput := kv.Put(p, nil)
+	if errput != nil {
+		return errput
 	}
-	_, meta, err := kv.Get(s.prefix, nil)
-	if err != nil {
-		return err
+
+	_, meta, errget := kv.Get(s.prefix, nil)
+	if errget != nil {
+		return errget
 	}
+
 	s.lastIndex = meta.LastIndex
 	return nil
 }
+
+func (s *ConsulDiscoveryService) GetMembers() error {
+	config := consul.DefaultConfig()
+	for idxip := range s.uris {
+		config.Address = s.uris[idxip]
+		client, errclient := consul.NewClient(config)
+		if errclient != nil {
+			continue
+		}
+
+		catalog := client.Catalog()
+		queryopts := &consul.QueryOptions{}
+		nodes, _, errnodes := catalog.Nodes(queryopts)
+		if errnodes != nil {
+			continue
+		}
+
+		for idxnode := range nodes {
+			member := nodes[idxnode].Address + ":8500"
+			s.machines = append(s.machines, member)
+			log.WithField("name", "consul").Debug("Add member to pool ", member)
+		}
+		break
+	}
+
+	if len(s.machines) < 1 {
+		return fmt.Errorf("Failed to get members")
+	}
+
+	return nil
+}
+
 func (s *ConsulDiscoveryService) Fetch() ([]*discovery.Entry, error) {
 	kv := s.client.KV()
 	pairs, _, err := kv.List(s.prefix, nil)
 	if err != nil {
+		errclient := s.InitializeClient()
+		if errclient != nil {
+			return nil, errclient
+		}
 		return nil, err
 	}
 
@@ -84,6 +146,13 @@ func (s *ConsulDiscoveryService) Register(addr string) error {
 	kv := s.client.KV()
 	p := &consul.KVPair{Key: path.Join(s.prefix, addr), Value: []byte(addr)}
 	_, err := kv.Put(p, nil)
+	if err != nil {
+		errclient := s.InitializeClient()
+		if errclient != nil {
+			return errclient
+		}
+		return err
+	}
 	return err
 }
 
@@ -97,7 +166,7 @@ func (s *ConsulDiscoveryService) waitForChange() <-chan uint64 {
 				WaitTime:  s.heartbeat}
 			_, meta, err := kv.List(s.prefix, option)
 			if err != nil {
-				log.WithField("name", "consul").Errorf("Discovery error: %v", err)
+				_ = s.InitializeClient()
 				break
 			}
 			s.lastIndex = meta.LastIndex
